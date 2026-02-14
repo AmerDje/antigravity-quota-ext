@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 const execAsync = promisify(exec);
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const DISPLAY_UPDATE_INTERVAL_MS = 30 * 1000; // Update countdown every 30s instead of 1s
+const LOW_QUOTA_THRESHOLD = 0.2; // 20% — warn when a model drops below this
 
 interface QuotaInfo {
   remainingFraction: number;
@@ -17,8 +18,19 @@ interface ClientModelConfig {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  const quotaProvider = new QuotaProvider();
+  // Status bar item — shows lowest quota at a glance
+  const statusBarItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Right,
+    100,
+  );
+  statusBarItem.command = 'quota-view.refreshEntry';
+  statusBarItem.tooltip = 'Antigravity Quotas — click to refresh';
+  statusBarItem.text = '$(loading~spin) Quotas';
+  statusBarItem.show();
+
+  const quotaProvider = new QuotaProvider(statusBarItem);
   context.subscriptions.push(
+    statusBarItem,
     vscode.window.registerTreeDataProvider('quota-view', quotaProvider),
     vscode.commands.registerCommand('quota-view.refreshEntry', () =>
       quotaProvider.manualRefresh(),
@@ -39,8 +51,11 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private timerInterval: NodeJS.Timeout | undefined;
   private isRefreshing = false;
   private lastError = false;
+  private statusBarItem: vscode.StatusBarItem;
+  private notifiedLowModels = new Set<string>(); // dedup notifications per model
 
-  constructor() {
+  constructor(statusBarItem: vscode.StatusBarItem) {
+    this.statusBarItem = statusBarItem;
     this.timerInterval = setInterval(() => {
       if (Date.now() >= this.nextFetchTime) {
         this.refresh();
@@ -73,12 +88,20 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       if (models.length > 0) {
         this.cachedModels = models;
         this.lastError = false;
+        this.updateStatusBar();
+        this.checkLowQuotaNotifications();
       } else if (this.cachedModels.length === 0) {
         this.lastError = true;
+        this.statusBarItem.text = '$(warning) Quotas N/A';
+        this.statusBarItem.backgroundColor = undefined;
       }
     } catch (e) {
       console.error('Failed to refresh quotas:', e);
       this.lastError = true;
+      this.statusBarItem.text = '$(error) Quotas';
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor(
+        'statusBarItem.errorBackground',
+      );
     } finally {
       this.isRefreshing = false;
     }
@@ -162,6 +185,77 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     });
 
     return [timerItem, ...modelItems];
+  }
+
+  /** Update status bar with the lowest quota model */
+  private updateStatusBar() {
+    if (this.cachedModels.length === 0) {
+      this.statusBarItem.text = '$(dash) Quotas';
+      this.statusBarItem.backgroundColor = undefined;
+      return;
+    }
+
+    // Find the model with the lowest remaining quota
+    let lowest = this.cachedModels[0];
+    for (const m of this.cachedModels) {
+      const frac = m.quotaInfo?.remainingFraction ?? 1;
+      if (frac < (lowest.quotaInfo?.remainingFraction ?? 1)) {
+        lowest = m;
+      }
+    }
+
+    const perc = Math.round((lowest.quotaInfo?.remainingFraction ?? 1) * 100);
+    const icon = perc > 50 ? '$(check)' : perc > 20 ? '$(warning)' : '$(error)';
+
+    this.statusBarItem.text = `${icon} ${perc}% ${lowest.label}`;
+    this.statusBarItem.tooltip = this.cachedModels
+      .map((m) => {
+        const p = Math.round((m.quotaInfo?.remainingFraction ?? 1) * 100);
+        return `${m.label}: ${p}%`;
+      })
+      .join('\n');
+
+    // Color-coded background
+    if (perc <= 20) {
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor(
+        'statusBarItem.errorBackground',
+      );
+    } else if (perc <= 50) {
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor(
+        'statusBarItem.warningBackground',
+      );
+    } else {
+      this.statusBarItem.backgroundColor = undefined;
+    }
+  }
+
+  /** Show a warning notification when any model drops below the threshold */
+  private checkLowQuotaNotifications() {
+    for (const m of this.cachedModels) {
+      const fraction = m.quotaInfo?.remainingFraction ?? 1;
+      const perc = Math.round(fraction * 100);
+
+      if (
+        fraction < LOW_QUOTA_THRESHOLD &&
+        !this.notifiedLowModels.has(m.label)
+      ) {
+        this.notifiedLowModels.add(m.label);
+        vscode.window
+          .showWarningMessage(
+            `⚡ ${m.label} quota is low: ${perc}% remaining`,
+            'Refresh Now',
+            'Dismiss',
+          )
+          .then((action) => {
+            if (action === 'Refresh Now') {
+              this.manualRefresh();
+            }
+          });
+      } else if (fraction >= LOW_QUOTA_THRESHOLD) {
+        // Reset notification flag when quota recovers (after reset)
+        this.notifiedLowModels.delete(m.label);
+      }
+    }
   }
 
   private async fetchQuotas(): Promise<ClientModelConfig[]> {
