@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 
 const execAsync = promisify(exec);
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const DISPLAY_UPDATE_INTERVAL_MS = 30 * 1000; // Update countdown every 30s instead of 1s
 
 interface QuotaInfo {
   remainingFraction: number;
@@ -17,13 +18,16 @@ interface ClientModelConfig {
 
 export function activate(context: vscode.ExtensionContext) {
   const quotaProvider = new QuotaProvider();
-  vscode.window.registerTreeDataProvider('quota-view', quotaProvider);
   context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('quota-view', quotaProvider),
     vscode.commands.registerCommand('quota-view.refreshEntry', () =>
       quotaProvider.manualRefresh(),
     ),
+    { dispose: () => quotaProvider.dispose() },
   );
 }
+
+export function deactivate() {}
 
 class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<
@@ -33,19 +37,24 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private nextFetchTime = Date.now() + REFRESH_INTERVAL_MS;
   private cachedModels: ClientModelConfig[] = [];
   private timerInterval: NodeJS.Timeout | undefined;
+  private isRefreshing = false;
+  private lastError = false;
 
   constructor() {
     this.timerInterval = setInterval(() => {
-      this._onDidChangeTreeData.fire();
       if (Date.now() >= this.nextFetchTime) {
         this.refresh();
+      } else {
+        // Only fire tree update for countdown display, not a full data refresh
+        this._onDidChangeTreeData.fire();
       }
-    }, 1000);
+    }, DISPLAY_UPDATE_INTERVAL_MS);
   }
 
   dispose() {
     if (this.timerInterval) {
       clearInterval(this.timerInterval);
+      this.timerInterval = undefined;
     }
   }
 
@@ -54,14 +63,24 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   }
 
   async refresh() {
+    if (this.isRefreshing) {
+      return;
+    }
+    this.isRefreshing = true;
     this.nextFetchTime = Date.now() + REFRESH_INTERVAL_MS;
     try {
       const models = await this.fetchQuotas();
       if (models.length > 0) {
         this.cachedModels = models;
+        this.lastError = false;
+      } else if (this.cachedModels.length === 0) {
+        this.lastError = true;
       }
     } catch (e) {
       console.error('Failed to refresh quotas:', e);
+      this.lastError = true;
+    } finally {
+      this.isRefreshing = false;
     }
     this._onDidChangeTreeData.fire();
   }
@@ -72,8 +91,8 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
   async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
     if (element) return [];
-    if (this.cachedModels.length === 0) {
-      // Don't await here to avoid blocking, just trigger background refresh if needed
+    if (this.cachedModels.length === 0 && !this.isRefreshing) {
+      // Don't await here to avoid blocking, just trigger background refresh
       this.refresh();
     }
 
@@ -85,6 +104,24 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       `Next check in: ${Math.floor(secondsLeft / 60)}:${(secondsLeft % 60).toString().padStart(2, '0')}`,
     );
     timerItem.iconPath = new vscode.ThemeIcon('watch');
+
+    // Show error state when no data is available
+    if (this.cachedModels.length === 0 && this.lastError) {
+      const errorItem = new vscode.TreeItem('Unable to fetch quotas');
+      errorItem.iconPath = new vscode.ThemeIcon(
+        'warning',
+        new vscode.ThemeColor('charts.yellow'),
+      );
+      errorItem.tooltip =
+        'Could not reach the language server. Click the refresh button to retry.';
+      return [timerItem, errorItem];
+    }
+
+    if (this.cachedModels.length === 0) {
+      const loadingItem = new vscode.TreeItem('Loading quotas…');
+      loadingItem.iconPath = new vscode.ThemeIcon('loading~spin');
+      return [timerItem, loadingItem];
+    }
 
     const modelItems = this.cachedModels.map((m) => {
       const perc = Math.round((m.quotaInfo?.remainingFraction ?? 1) * 100);
@@ -153,7 +190,7 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
                 metadata: {
                   ideName: 'antigravity',
                   extensionName: 'antigravity',
-                  locale: 'en',
+                  locale: vscode.env.language,
                 },
               }),
             },
@@ -183,29 +220,30 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
     try {
       if (isWindows) {
-        // Windows: Use wmic to get commandserver process info
-        // Look for processes with 'language_server' in command line
+        // Use PowerShell Get-CimInstance instead of deprecated wmic
         const { stdout } = await execAsync(
-          "wmic process where \"Name='language_server_windows_x64.exe' OR CommandLine like '%language_server%'\" get ProcessId,CommandLine /format:csv",
+          `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server*' -or $_.CommandLine -like '*language_server*' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"`,
         );
 
-        // Parse CSV output
-        // Node,CommandLine,ProcessId
-        const lines = stdout
-          .trim()
-          .split('\r\n')
-          .filter((l) => l.trim().length > 0)
-          .slice(1); // Skip header
+        const trimmed = stdout.trim();
+        if (!trimmed || trimmed === '') {
+          return null;
+        }
 
-        for (const line of lines) {
-          // CSV parsing manual handling for potential quotes
-          const parts = line.split(',');
-          // format:csv output: Node,CommandLine,ProcessId.
-          // Usually the last element is PID.
-          const pid = parts[parts.length - 1]?.trim();
-          const commandLine = parts.slice(1, parts.length - 1).join(',');
+        // PowerShell returns an object for 1 result, array for multiple
+        let processes: Array<{ ProcessId: number; CommandLine: string }>;
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          processes = parsed;
+        } else {
+          processes = [parsed];
+        }
 
-          if (commandLine && pid) {
+        for (const proc of processes) {
+          const pid = String(proc.ProcessId);
+          const commandLine = proc.CommandLine || '';
+
+          if (commandLine && pid && /^\d+$/.test(pid)) {
             const csrf = this.extractCsrf(commandLine);
             return { pid, csrf };
           }
@@ -219,6 +257,8 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         if (!line) return null;
 
         const pid = line.trim().split(/\s+/)[1];
+        if (!pid || !/^\d+$/.test(pid)) return null;
+
         const csrf = this.extractCsrf(line);
         return { pid, csrf };
       }
@@ -236,11 +276,15 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   }
 
   private async getListeningPorts(pid: string): Promise<string[]> {
+    // Validate PID to prevent shell injection
+    if (!/^\d+$/.test(pid)) {
+      return [];
+    }
+
     const isWindows = process.platform === 'win32';
     try {
       if (isWindows) {
-        // Windows: use netstat -ano
-        // Filter by PID in JS to ensure exact match and avoid port collisions
+        // Windows: use netstat -ano and filter by PID in JS
         const { stdout } = await execAsync(`netstat -ano`);
         const ports = new Set<string>();
 
