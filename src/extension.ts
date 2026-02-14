@@ -155,10 +155,16 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         try {
           const date = new Date(m.quotaInfo.resetTime);
           if (!isNaN(date.getTime())) {
-            resetTimeDisplay = date.toLocaleTimeString([], {
-              hour: 'numeric',
-              minute: '2-digit',
-            });
+            resetTimeDisplay =
+              date.toLocaleDateString([], {
+                month: 'short',
+                day: 'numeric',
+              }) +
+              ', ' +
+              date.toLocaleTimeString([], {
+                hour: 'numeric',
+                minute: '2-digit',
+              });
           }
         } catch (e) {
           /* ignore parse errors */
