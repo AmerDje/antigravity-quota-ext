@@ -89,9 +89,27 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     const modelItems = this.cachedModels.map((m) => {
       const perc = Math.round((m.quotaInfo?.remainingFraction ?? 1) * 100);
       const item = new vscode.TreeItem(m.label);
-      item.description = `${perc}% remaining`;
+
+      let resetTimeDisplay = '';
+      if (m.quotaInfo?.resetTime) {
+        try {
+          const date = new Date(m.quotaInfo.resetTime);
+          if (!isNaN(date.getTime())) {
+            resetTimeDisplay = date.toLocaleTimeString([], {
+              hour: 'numeric',
+              minute: '2-digit',
+            });
+          }
+        } catch (e) {
+          /* ignore parse errors */
+        }
+      }
+
+      item.description = `${perc}%${resetTimeDisplay ? ` • Resets ${resetTimeDisplay}` : ''}`;
+
       const filled = Math.round(perc / 10);
-      item.tooltip = `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${perc}%\nResets: ${m.quotaInfo?.resetTime || 'N/A'}`;
+      item.tooltip = `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${perc}%${resetTimeDisplay ? `\nResets at ${resetTimeDisplay}` : ''}`;
+
       // Color logic: Green > 50, Yellow > 20, Red <= 20
       item.iconPath = new vscode.ThemeIcon(
         perc > 50 ? 'check' : perc > 20 ? 'warning' : 'error',
