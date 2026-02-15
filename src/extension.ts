@@ -147,7 +147,7 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     }
 
     const modelItems = this.cachedModels.map((m) => {
-      const perc = Math.round((m.quotaInfo?.remainingFraction ?? 1) * 100);
+      const perc = Math.round((m.quotaInfo?.remainingFraction ?? 0) * 100);
       const item = new vscode.TreeItem(m.label);
 
       let resetTimeDisplay = '';
@@ -204,19 +204,19 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     // Find the model with the lowest remaining quota
     let lowest = this.cachedModels[0];
     for (const m of this.cachedModels) {
-      const frac = m.quotaInfo?.remainingFraction ?? 1;
-      if (frac < (lowest.quotaInfo?.remainingFraction ?? 1)) {
+      const frac = m.quotaInfo?.remainingFraction ?? 0;
+      if (frac < (lowest.quotaInfo?.remainingFraction ?? 0)) {
         lowest = m;
       }
     }
 
-    const perc = Math.round((lowest.quotaInfo?.remainingFraction ?? 1) * 100);
+    const perc = Math.round((lowest.quotaInfo?.remainingFraction ?? 0) * 100);
     const icon = perc > 50 ? '$(check)' : perc > 20 ? '$(warning)' : '$(error)';
 
     this.statusBarItem.text = `${icon} ${perc}% ${lowest.label}`;
     this.statusBarItem.tooltip = this.cachedModels
       .map((m) => {
-        const p = Math.round((m.quotaInfo?.remainingFraction ?? 1) * 100);
+        const p = Math.round((m.quotaInfo?.remainingFraction ?? 0) * 100);
         return `${m.label}: ${p}%`;
       })
       .join('\n');
@@ -238,7 +238,7 @@ class QuotaProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   /** Show a warning notification when any model drops below the threshold */
   private checkLowQuotaNotifications() {
     for (const m of this.cachedModels) {
-      const fraction = m.quotaInfo?.remainingFraction ?? 1;
+      const fraction = m.quotaInfo?.remainingFraction ?? 0;
       const perc = Math.round(fraction * 100);
 
       if (
